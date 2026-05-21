@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.collect
 import kotlinx.serialization.json.Json
 import java.util.UUID
 import javax.inject.Inject
@@ -41,7 +43,8 @@ class AgentLoop @Inject constructor(
     private val planManager: PlanManager,
     private val actionDispatcher: ActionDispatcher,
     private val memoryManager: MemoryManager,
-    private val conversationRepository: ConversationRepository
+    private val conversationRepository: ConversationRepository,
+    private val settingsRepository: com.opendroid.ai.data.repository.SettingsRepository
 ) {
     private val scope = CoroutineScope(Dispatchers.Default)
     private val json = Json { ignoreUnknownKeys = true }
@@ -93,36 +96,51 @@ class AgentLoop @Inject constructor(
                 $relevantContext
             """.trimIndent()
 
-            val lastMsgs = conversationRepository.getLastMessages(10).map {
-                com.opendroid.ai.core.llm.LLMMessage(
-                    role = if (it.sender == ChatMessage.Sender.USER) "user" else "assistant",
-                    content = it.text
-                )
-            }
+            val lastMsgs = conversationRepository.getLastMessages(10)
 
-            val response = provider.complete(
-                LLMRequest(
-                    systemPrompt = systemPrompt,
-                    messages = lastMsgs,
-                    temperature = 0.5f,
-                    maxTokens = 500,
-                    responseFormat = ResponseFormat.TEXT
-                )
-            )
-
-            val replyText = response.content.trim()
+            val replyId = UUID.randomUUID().toString()
+            var currentReplyText = ""
             val replyMsg = ChatMessage(
-                id = UUID.randomUUID().toString(),
-                text = replyText,
-                sender = ChatMessage.Sender.ASSISTANT,
+                id = replyId,
+                text = currentReplyText,
+                sender = ChatMessage.Sender.AGENT,
                 modelBadge = provider.name
             )
-            
-            memoryManager.storeMessage(replyMsg)
             conversationRepository.insertMessage(replyMsg)
 
-            _agentState.value = AgentState.Speaking(replyText)
-            onSpeakCallback?.invoke(replyText)
+            try {
+                provider.streamComplete(
+                    LLMRequest(
+                        systemPrompt = systemPrompt,
+                        messages = lastMsgs,
+                        temperature = 0.5f,
+                        maxTokens = 500,
+                        responseFormat = ResponseFormat.TEXT
+                    )
+                ).collect { chunk ->
+                    currentReplyText += chunk
+                    conversationRepository.insertMessage(replyMsg.copy(text = currentReplyText))
+                }
+            } catch (streamError: Exception) {
+                if (currentReplyText.isEmpty()) {
+                    val response = provider.complete(
+                        LLMRequest(
+                            systemPrompt = systemPrompt,
+                            messages = lastMsgs,
+                            temperature = 0.5f,
+                            maxTokens = 500,
+                            responseFormat = ResponseFormat.TEXT
+                        )
+                    )
+                    currentReplyText = response.content.trim()
+                    conversationRepository.insertMessage(replyMsg.copy(text = currentReplyText))
+                }
+            }
+
+            val finalReplyMsg = replyMsg.copy(text = currentReplyText)
+            memoryManager.storeMessage(finalReplyMsg)
+            _agentState.value = AgentState.Speaking(currentReplyText)
+            onSpeakCallback?.invoke(currentReplyText)
         } catch (e: Exception) {
             _agentState.value = AgentState.Error("Simple execution failed: ${e.localizedMessage}")
         }
@@ -132,24 +150,79 @@ class AgentLoop @Inject constructor(
         try {
             val provider = llmProviderFactory.getActiveProvider()
             val relevantContext = memoryManager.getRelevantContext(query)
-
             val sysPrompt = "${PlanningPrompts.PLANNING_SYSTEM_PROMPT}\n\nContext about user and device:\n$relevantContext"
             
-            val response = provider.complete(
-                LLMRequest(
-                    systemPrompt = sysPrompt,
-                    messages = listOf(
-                        com.opendroid.ai.core.llm.LLMMessage(role = "user", content = query)
-                    ),
-                    temperature = 0.1f,
-                    maxTokens = 1500,
-                    responseFormat = ResponseFormat.JSON
-                )
-            )
+            val config = settingsRepository.llmConfig.first()
+            val plan = if (config.multiAgentModeEnabled) {
+                val plannerDeferred = kotlinx.coroutines.async(Dispatchers.Default) {
+                    provider.complete(
+                        LLMRequest(
+                            systemPrompt = sysPrompt,
+                            messages = listOf(
+                                ChatMessage(id = UUID.randomUUID().toString(), text = query, sender = ChatMessage.Sender.USER)
+                            ),
+                            temperature = 0.2f,
+                            maxTokens = 1500,
+                            responseFormat = ResponseFormat.JSON
+                        )
+                    )
+                }
 
-            val cleaned = cleanPlanJson(response.content)
-            val plan = json.decodeFromString<Plan>(cleaned)
-            
+                val criticDeferred = kotlinx.coroutines.async(Dispatchers.Default) {
+                    provider.complete(
+                        LLMRequest(
+                            systemPrompt = PlanningPrompts.CRITIC_SYSTEM_PROMPT,
+                            messages = listOf(
+                                ChatMessage(id = UUID.randomUUID().toString(), text = query, sender = ChatMessage.Sender.USER)
+                            ),
+                            temperature = 0.2f,
+                            maxTokens = 1000,
+                            responseFormat = ResponseFormat.TEXT
+                        )
+                    )
+                }
+
+                val plannerResponse = plannerDeferred.await()
+                val criticResponse = criticDeferred.await()
+
+                val mergePrompt = """
+                    ${PlanningPrompts.MERGE_SYSTEM_PROMPT}
+                    
+                    User Goal: $query
+                    Initial Plan: ${plannerResponse.content}
+                    Critic Safety & Edge Case Report: ${criticResponse.content}
+                """.trimIndent()
+
+                val mergeResponse = provider.complete(
+                    LLMRequest(
+                        systemPrompt = mergePrompt,
+                        messages = listOf(
+                            ChatMessage(id = UUID.randomUUID().toString(), text = "Merge the plan and critique into the final JSON plan.", sender = ChatMessage.Sender.USER)
+                        ),
+                        temperature = 0.1f,
+                        maxTokens = 1500,
+                        responseFormat = ResponseFormat.JSON
+                    )
+                )
+
+                val cleaned = cleanPlanJson(mergeResponse.content)
+                json.decodeFromString<Plan>(cleaned)
+            } else {
+                val response = provider.complete(
+                    LLMRequest(
+                        systemPrompt = sysPrompt,
+                        messages = listOf(
+                            ChatMessage(id = UUID.randomUUID().toString(), text = query, sender = ChatMessage.Sender.USER)
+                        ),
+                        temperature = 0.1f,
+                        maxTokens = 1500,
+                        responseFormat = ResponseFormat.JSON
+                    )
+                )
+                val cleaned = cleanPlanJson(response.content)
+                json.decodeFromString<Plan>(cleaned)
+            }
+
             planManager.startNewPlan(plan)
             _agentState.value = AgentState.PlanProposed(plan)
         } catch (e: Exception) {
@@ -281,7 +354,7 @@ class AgentLoop @Inject constructor(
         val assistantMsg = ChatMessage(
             id = UUID.randomUUID().toString(),
             text = summaryText,
-            sender = ChatMessage.Sender.ASSISTANT,
+            sender = ChatMessage.Sender.AGENT,
             modelBadge = "System"
         )
         memoryManager.storeMessage(assistantMsg)

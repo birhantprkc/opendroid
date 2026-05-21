@@ -51,9 +51,10 @@ class ReEvaluationEngine @Inject constructor(
                 LLMRequest(
                     systemPrompt = ReEvalPrompts.RE_EVAL_SYSTEM_PROMPT,
                     messages = listOf(
-                        com.opendroid.ai.core.llm.LLMMessage(
-                            role = "user",
-                            content = inputDetails
+                        com.opendroid.ai.data.models.ChatMessage(
+                            id = java.util.UUID.randomUUID().toString(),
+                            text = inputDetails,
+                            sender = com.opendroid.ai.data.models.ChatMessage.Sender.USER
                         )
                     ),
                     temperature = 0.0f,
