@@ -1,0 +1,93 @@
+package com.opendroid.ai.core.memory
+
+import com.opendroid.ai.data.models.ChatMessage
+import com.opendroid.ai.data.models.Memory
+import com.opendroid.ai.data.models.MemoryType
+import com.opendroid.ai.data.repository.ConversationRepository
+import com.opendroid.ai.data.repository.MemoryRepository
+import kotlinx.coroutines.flow.first
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class MemoryManager @Inject constructor(
+    val workingMemory: WorkingMemory,
+    val episodicMemory: EpisodicMemory,
+    val semanticMemory: SemanticMemory,
+    val proceduralMemory: ProceduralMemory,
+    private val memoryExtractor: MemoryExtractor,
+    private val conversationRepository: ConversationRepository,
+    private val memoryRepository: MemoryRepository
+) {
+    private val json = Json { prettyPrint = true }
+
+    suspend fun storeMessage(message: ChatMessage) {
+        workingMemory.addMessage(message)
+        episodicMemory.storeMessage(message)
+
+        // Automatically extract facts from the latest conversation turn
+        val recent = conversationRepository.getLastMessages(5)
+        extractFacts(recent)
+    }
+
+    suspend fun extractFacts(conversation: List<ChatMessage>) {
+        memoryExtractor.extractFacts(conversation)
+    }
+
+    suspend fun recall(query: String): List<Memory> {
+        return searchMemory(query)
+    }
+
+    suspend fun getRelevantContext(currentGoal: String): String {
+        // Collect facts from semantic database
+        val facts = memoryRepository.getMemoriesByType(MemoryType.SEMANTIC)
+        val factsContext = facts.joinToString("; ") { "${it.key}: ${it.value}" }
+        
+        // Context from working memory
+        val activePlanStr = workingMemory.activePlan?.let { "Active Plan Goal: ${it.goal}" } ?: "No active plan."
+        
+        return """
+            [Facts about User]
+            $factsContext
+            
+            [Working Session State]
+            $activePlanStr
+            Device State: Location=${workingMemory.location}, Battery=${workingMemory.batteryLevel}%, WiFi=${workingMemory.wifiState}, Connection=${workingMemory.connectivity}
+        """.trimIndent()
+    }
+
+    suspend fun summarizeOldConversations() {
+        // Compress old logs if message count > 50
+        val history = conversationRepository.getLastMessages(60)
+        if (history.size >= 50) {
+            val textToCompress = history.joinToString("\n") { "${it.sender.name}: ${it.text}" }
+            // Add a compiled summary fact
+            semanticMemory.storeFact(
+                "conversation_summary_${System.currentTimeMillis()}",
+                "Recent dialogue summary compiled: ${textToCompress.take(200)}..."
+            )
+            // Optional: prune old messages from db if needed to save space
+        }
+    }
+
+    suspend fun exportMemory(): String {
+        val memories = memoryRepository.allMemories.first()
+        return json.encodeToString(memories)
+    }
+
+    suspend fun clearMemory(type: MemoryType) {
+        memoryRepository.clearMemoryByType(type)
+        if (type == MemoryType.WORKING) {
+            workingMemory.clear()
+        }
+    }
+
+    suspend fun searchMemory(query: String): List<Memory> {
+        val all = memoryRepository.allMemories.first()
+        return all.filter {
+            it.key.contains(query, ignoreCase = true) || it.value.contains(query, ignoreCase = true)
+        }
+    }
+}

@@ -1,0 +1,304 @@
+package com.opendroid.ai.core.agent
+
+import android.content.Context
+import com.opendroid.ai.actions.ActionDispatcher
+import com.opendroid.ai.core.llm.LLMProviderFactory
+import com.opendroid.ai.core.llm.LLMRequest
+import com.opendroid.ai.core.llm.ResponseFormat
+import com.opendroid.ai.core.llm.prompts.PlanningPrompts
+import com.opendroid.ai.core.memory.MemoryManager
+import com.opendroid.ai.data.models.ChatMessage
+import com.opendroid.ai.data.models.Plan
+import com.opendroid.ai.data.models.PlanStatus
+import com.opendroid.ai.data.models.PlanStep
+import com.opendroid.ai.data.models.StepStatus
+import com.opendroid.ai.data.repository.ConversationRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import java.util.UUID
+import javax.inject.Inject
+import javax.inject.Singleton
+
+sealed interface AgentState {
+    object Idle : AgentState
+    object Thinking : AgentState
+    data class PlanProposed(val plan: Plan) : AgentState
+    data class ExecutingPlan(val currentStepDesc: String) : AgentState
+    data class Speaking(val text: String) : AgentState
+    data class Error(val message: String) : AgentState
+}
+
+@Singleton
+class AgentLoop @Inject constructor(
+    private val intentClassifier: IntentClassifier,
+    private val llmProviderFactory: LLMProviderFactory,
+    private val planManager: PlanManager,
+    private val actionDispatcher: ActionDispatcher,
+    private val memoryManager: MemoryManager,
+    private val conversationRepository: ConversationRepository
+) {
+    private val scope = CoroutineScope(Dispatchers.Default)
+    private val json = Json { ignoreUnknownKeys = true }
+
+    private val _agentState = MutableStateFlow<AgentState>(AgentState.Idle)
+    val agentState: StateFlow<AgentState> = _agentState.asStateFlow()
+
+    // Speak callback to be implemented by TTS service
+    var onSpeakCallback: ((String) -> Unit)? = null
+
+    fun processQuery(query: String, context: Context) {
+        scope.launch {
+            try {
+                _agentState.value = AgentState.Thinking
+                
+                // Save user message
+                val userMsg = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    text = query,
+                    sender = ChatMessage.Sender.USER,
+                    modelBadge = null
+                )
+                memoryManager.storeMessage(userMsg)
+                conversationRepository.insertMessage(userMsg)
+
+                // 1. Intent Classification
+                val isComplex = intentClassifier.isComplex(query)
+                if (isComplex) {
+                    generatePlan(query, context)
+                } else {
+                    executeSimpleQuery(query)
+                }
+            } catch (e: Exception) {
+                _agentState.value = AgentState.Error(e.localizedMessage ?: "Unknown processing error")
+            }
+        }
+    }
+
+    private suspend fun executeSimpleQuery(query: String) {
+        try {
+            val provider = llmProviderFactory.getActiveProvider()
+            val relevantContext = memoryManager.getRelevantContext(query)
+            
+            val systemPrompt = """
+                You are OpenDroid, a professional and precise autonomous Android AI Assistant. 
+                Answer the user's question directly. Keep answers concise, clear, and professional.
+                
+                Context about user and device state:
+                $relevantContext
+            """.trimIndent()
+
+            val lastMsgs = conversationRepository.getLastMessages(10).map {
+                com.opendroid.ai.core.llm.LLMMessage(
+                    role = if (it.sender == ChatMessage.Sender.USER) "user" else "assistant",
+                    content = it.text
+                )
+            }
+
+            val response = provider.complete(
+                LLMRequest(
+                    systemPrompt = systemPrompt,
+                    messages = lastMsgs,
+                    temperature = 0.5f,
+                    maxTokens = 500,
+                    responseFormat = ResponseFormat.TEXT
+                )
+            )
+
+            val replyText = response.content.trim()
+            val replyMsg = ChatMessage(
+                id = UUID.randomUUID().toString(),
+                text = replyText,
+                sender = ChatMessage.Sender.ASSISTANT,
+                modelBadge = provider.name
+            )
+            
+            memoryManager.storeMessage(replyMsg)
+            conversationRepository.insertMessage(replyMsg)
+
+            _agentState.value = AgentState.Speaking(replyText)
+            onSpeakCallback?.invoke(replyText)
+        } catch (e: Exception) {
+            _agentState.value = AgentState.Error("Simple execution failed: ${e.localizedMessage}")
+        }
+    }
+
+    private suspend fun generatePlan(query: String, context: Context) {
+        try {
+            val provider = llmProviderFactory.getActiveProvider()
+            val relevantContext = memoryManager.getRelevantContext(query)
+
+            val sysPrompt = "${PlanningPrompts.PLANNING_SYSTEM_PROMPT}\n\nContext about user and device:\n$relevantContext"
+            
+            val response = provider.complete(
+                LLMRequest(
+                    systemPrompt = sysPrompt,
+                    messages = listOf(
+                        com.opendroid.ai.core.llm.LLMMessage(role = "user", content = query)
+                    ),
+                    temperature = 0.1f,
+                    maxTokens = 1500,
+                    responseFormat = ResponseFormat.JSON
+                )
+            )
+
+            val cleaned = cleanPlanJson(response.content)
+            val plan = json.decodeFromString<Plan>(cleaned)
+            
+            planManager.startNewPlan(plan)
+            _agentState.value = AgentState.PlanProposed(plan)
+        } catch (e: Exception) {
+            // Fallback: If planning fails, process as simple query
+            executeSimpleQuery(query)
+        }
+    }
+
+    fun approveProposedPlan(context: Context) {
+        scope.launch {
+            val plan = planManager.currentPlan.value ?: return@launch
+            executePlanLoop(plan, context)
+        }
+    }
+
+    fun rejectProposedPlan() {
+        planManager.clearPlan()
+        _agentState.value = AgentState.Idle
+    }
+
+    private suspend fun executePlanLoop(plan: Plan, context: Context) {
+        planManager.updatePlanStatus(PlanStatus.RUNNING)
+        var currentPlanState = planManager.currentPlan.value ?: return
+
+        while (true) {
+            val nextStep = planManager.getActiveStep()
+            if (nextStep == null) {
+                // If there are any failed steps, plan is failed. Otherwise, completed!
+                val hasFailed = currentPlanState.steps.any { it.status == StepStatus.FAILED }
+                if (hasFailed) {
+                    planManager.updatePlanStatus(PlanStatus.FAILED)
+                    speakAndSaveSummary(currentPlanState, false)
+                } else {
+                    planManager.updatePlanStatus(PlanStatus.COMPLETED)
+                    speakAndSaveSummary(currentPlanState, true)
+                }
+                break
+            }
+
+            _agentState.value = AgentState.ExecutingPlan(nextStep.description)
+            planManager.updateStepStatus(nextStep.stepId, StepStatus.RUNNING)
+
+            // Execute the action dispatcher
+            val actionResult = actionDispatcher.execute(nextStep.action, nextStep.params, context)
+
+            if (actionResult.success) {
+                planManager.updateStepStatus(
+                    nextStep.stepId,
+                    StepStatus.COMPLETED,
+                    result = actionResult.data ?: "Completed successfully."
+                )
+            } else {
+                // Try fallback action
+                if (nextStep.fallback.isNotEmpty() && actionDispatcher.hasAction(nextStep.fallback)) {
+                    val fallbackResult = actionDispatcher.execute(nextStep.fallback, nextStep.params, context)
+                    if (fallbackResult.success) {
+                        planManager.updateStepStatus(
+                            nextStep.stepId,
+                            StepStatus.COMPLETED,
+                            result = "Primary failed: ${actionResult.error}. Fallback execution succeeded: ${fallbackResult.data}"
+                        )
+                    } else {
+                        planManager.updateStepStatus(
+                            nextStep.stepId,
+                            StepStatus.FAILED,
+                            error = "Primary failed: ${actionResult.error}. Fallback failed: ${fallbackResult.error}"
+                        )
+                    }
+                } else {
+                    planManager.updateStepStatus(
+                        nextStep.stepId,
+                        StepStatus.FAILED,
+                        error = actionResult.error ?: "Action execution failed."
+                    )
+                }
+            }
+
+            // Refresh current state of plan
+            currentPlanState = planManager.currentPlan.value ?: break
+
+            // Re-evaluate Plan Loop
+            val completed = currentPlanState.steps.filter { it.status == StepStatus.COMPLETED }
+            val failed = currentPlanState.steps.filter { it.status == StepStatus.FAILED }
+            val remaining = currentPlanState.steps.filter { it.status == StepStatus.PENDING }
+
+            val reEvalEngine = ReEvaluationEngine(llmProviderFactory)
+            val reEval = reEvalEngine.evaluateStepResult(
+                originalGoal = currentPlanState.goal,
+                completedSteps = completed,
+                failedSteps = failed,
+                remainingSteps = remaining,
+                planId = currentPlanState.planId
+            )
+
+            // Speak post-step evaluation speech if any
+            if (reEval.speech.isNotEmpty()) {
+                onSpeakCallback?.invoke(reEval.speech)
+            }
+
+            when (reEval.decision.uppercase()) {
+                "ABANDON" -> {
+                    planManager.updatePlanStatus(PlanStatus.FAILED)
+                    speakAndSaveSummary(currentPlanState, false)
+                    return
+                }
+                "MODIFY" -> {
+                    if (reEval.updatedPlan != null) {
+                        val mergedSteps = currentPlanState.steps.filter { it.status != StepStatus.PENDING } +
+                                reEval.updatedPlan.steps.filter { step ->
+                                    currentPlanState.steps.none { it.stepId == step.stepId }
+                                }
+                        planManager.startNewPlan(currentPlanState.copy(steps = mergedSteps))
+                    }
+                }
+                "CONTINUE" -> {
+                    // Do nothing, continue to next step
+                }
+            }
+        }
+    }
+
+    private suspend fun speakAndSaveSummary(plan: Plan, isSuccess: Boolean) {
+        val summaryText = if (isSuccess) {
+            "Successfully completed your task: '${plan.goal}'."
+        } else {
+            "Failed to complete task: '${plan.goal}'."
+        }
+
+        val assistantMsg = ChatMessage(
+            id = UUID.randomUUID().toString(),
+            text = summaryText,
+            sender = ChatMessage.Sender.ASSISTANT,
+            modelBadge = "System"
+        )
+        memoryManager.storeMessage(assistantMsg)
+        conversationRepository.insertMessage(assistantMsg)
+
+        _agentState.value = AgentState.Speaking(summaryText)
+        onSpeakCallback?.invoke(summaryText)
+    }
+
+    private fun cleanPlanJson(raw: String): String {
+        var content = raw.trim()
+        if (content.startsWith("```json")) {
+            content = content.removePrefix("```json")
+        }
+        if (content.endsWith("```")) {
+            content = content.removeSuffix("```")
+        }
+        return content.trim()
+    }
+}

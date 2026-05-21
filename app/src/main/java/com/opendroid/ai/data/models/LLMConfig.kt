@@ -1,0 +1,16 @@
+package com.opendroid.ai.data.models
+
+import kotlinx.serialization.Serializable
+
+@Serializable
+data class LLMConfig(
+    val activeProvider: String = "Google Gemini",
+    val activeModel: String = "gemini-2.0-flash",
+    val apiKeys: Map<String, String> = emptyMap(), // Provider -> API Key
+    val customEndpoints: Map<String, String> = emptyMap(), // Provider -> URL
+    val autoConfirmPlans: Boolean = false,
+    val latencyBenchmarks: Map<String, Long> = emptyMap(), // Provider -> latency Ms
+    val elevenLabsApiKey: String = "",
+    val elevenLabsVoiceId: String = "",
+    val ollamaUrl: String = "http://10.0.2.2:11434" // Default to Android emulator host loopback
+)
